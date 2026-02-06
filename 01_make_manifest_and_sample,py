@@ -1,0 +1,44 @@
+import os, glob, csv, random, shutil
+
+SRC_ROOT = r"C:\Users\Dell\Desktop\Case Study 2\data_gen_signet"
+
+SEG_ROOT   = r"C:\Users\Dell\Desktop\Case Study 2\Segmentation\seg_dataset"
+IMG_DIR    = os.path.join(SEG_ROOT, "images")      
+ANN_DIR    = os.path.join(SEG_ROOT, "annotations") 
+MSK_DIR    = os.path.join(SEG_ROOT, "masks")       
+os.makedirs(IMG_DIR, exist_ok=True)
+os.makedirs(ANN_DIR, exist_ok=True)
+os.makedirs(MSK_DIR, exist_ok=True)
+
+MANIFEST = r"C:\Users\Dell\Desktop\Case Study 2\Segmentation\all_images.csv"
+
+
+N_GOLD = 500
+SEED = 42
+
+
+img_paths = glob.glob(os.path.join(SRC_ROOT, "**", "*.jpg"), recursive=True)
+
+with open(MANIFEST, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["path", "relpath", "group_id", "filename"])
+    for p in img_paths:
+        rel = os.path.relpath(p, SRC_ROOT)
+        group_id = rel.split(os.sep)[0] if os.sep in rel else ""
+        w.writerow([p, rel, group_id, os.path.basename(p)])
+
+print("Manifest written:", MANIFEST)
+print("Total images found:", len(img_paths))
+
+
+random.seed(SEED)
+chosen = random.sample(img_paths, min(N_GOLD, len(img_paths)))
+
+for p in chosen:
+    
+    rel = os.path.relpath(p, SRC_ROOT).replace("\\", "__").replace("/", "__")
+    out = os.path.join(IMG_DIR, rel)
+    shutil.copy2(p, out)
+
+print("Gold set copied:", len(chosen), "->", IMG_DIR)
+print("Next: label these in LabelMe (signature-only).")
