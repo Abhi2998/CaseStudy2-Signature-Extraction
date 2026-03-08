@@ -1,29 +1,29 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import cv2, os, glob
 import numpy as np
 from tqdm import tqdm
 
-from torchmetrics.image import StructuralSimilarityIndexMeasure
-
-
 class UNet(nn.Module):
     def __init__(self):
         super().__init__()
+        # Encoder
         self.enc1 = self.conv_block(3, 64)
         self.enc2 = self.conv_block(64, 128)
         self.enc3 = self.conv_block(128, 256)
-        self.enc4 = self.conv_block(256, 512) 
+        self.enc4 = self.conv_block(256, 512) # Level 4 for massive receptive field
         
+        # Dropout to brutally punish overfitting
         self.dropout = nn.Dropout2d(0.5)
         
+        # Decoder upsampling layers
         self.up1 = nn.ConvTranspose2d(512, 256, 2, stride=2)
         self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2)
         self.up3 = nn.ConvTranspose2d(128, 64, 2, stride=2)
         
+        # Decoder conv blocks
         self.dec1 = self.conv_block(512, 256)
         self.dec2 = self.conv_block(256, 128)
         self.dec3 = self.conv_block(128, 64)
@@ -31,6 +31,7 @@ class UNet(nn.Module):
         self.final = nn.Conv2d(64, 1, 1)
         
     def conv_block(self, in_ch, out_ch):
+        # Injected Batch Normalization for stable, faster convergence
         return nn.Sequential(
             nn.Conv2d(in_ch, out_ch, 3, padding=1),
             nn.BatchNorm2d(out_ch),
@@ -41,13 +42,15 @@ class UNet(nn.Module):
         )
     
     def forward(self, x):
-        e1 = self.enc1(x)                                 
-        e2 = self.enc2(nn.MaxPool2d(2)(e1))               
-        e3 = self.enc3(nn.MaxPool2d(2)(e2))               
-        e4 = self.enc4(nn.MaxPool2d(2)(e3))               
-        
+        # Encoder
+        e1 = self.enc1(x)                                 # [B, 64, H, W]
+        e2 = self.enc2(nn.MaxPool2d(2)(e1))               # [B, 128, H/2, W/2]
+        e3 = self.enc3(nn.MaxPool2d(2)(e2))               # [B, 256, H/4, W/4]
+        e4 = self.enc4(nn.MaxPool2d(2)(e3))               # [B, 512, H/8, W/8]
+ 
         e4 = self.dropout(e4)
         
+        # Decoder
         d1 = self.up1(e4)                                 
         d1 = torch.cat([d1, e3], dim=1)                   
         d1 = self.dec1(d1)                                
@@ -60,8 +63,8 @@ class UNet(nn.Module):
         d3 = torch.cat([d3, e1], dim=1)                   
         d3 = self.dec3(d3)                                
         
+        # Outputting raw logits for numerical stability
         return self.final(d3)
-
 
 class SegDataset(Dataset):
     def __init__(self, img_dir, mask_dir, size=256):
@@ -69,6 +72,7 @@ class SegDataset(Dataset):
         self.masks = sorted(glob.glob(f"{mask_dir}/*.png"))
         self.size = size
         print(f"Found {len(self.imgs)} images, {len(self.masks)} masks")
+        assert len(self.imgs) == len(self.masks)
     
     def __len__(self): return len(self.imgs)
     
@@ -81,53 +85,40 @@ class SegDataset(Dataset):
         mask = (mask > 0.5).astype(np.float32)
         
         return torch.FloatTensor(img.transpose(2,0,1)), torch.FloatTensor(mask).unsqueeze(0)
-
-
-class FocalDiceLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.25, dice_weight=0.5, smooth=1e-5):
-        super(FocalDiceLoss, self).__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.dice_weight = dice_weight
+    
+class BCEDiceLoss(nn.Module):
+    def __init__(self, bce_weight=0.5, smooth=1e-5):
+        super(BCEDiceLoss, self).__init__()
+        self.bce_weight = bce_weight
         self.smooth = smooth
+        self.bce = nn.BCEWithLogitsLoss()
 
     def forward(self, inputs, targets):
-        # --- Focal Loss (Punish hard pixels) ---
-        bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
-        p_t = torch.exp(-bce_loss)
-        focal_loss = self.alpha * (1 - p_t) ** self.gamma * bce_loss
-        focal_loss = focal_loss.mean() 
-
-        # --- Dice Loss (Reward overlap) ---
+        bce_loss = self.bce(inputs, targets)
         inputs_soft = torch.sigmoid(inputs)
         inputs_flat = inputs_soft.view(-1)
         targets_flat = targets.view(-1)
-        
         intersection = (inputs_flat * targets_flat).sum()                            
         dice_score = (2. * intersection + self.smooth) / (inputs_flat.sum() + targets_flat.sum() + self.smooth)
         dice_loss = 1 - dice_score
-        
-        return ((1 - self.dice_weight) * focal_loss) + (self.dice_weight * dice_loss)
-
-
+        total_loss = (self.bce_weight * bce_loss) + ((1 - self.bce_weight) * dice_loss)
+        return total_loss
+    
 if __name__ == '__main__':
-    # PATHS
     IMG_DIR = r"C:\Users\Dell\Desktop\Case Study 2\Segmentation\auto_masks\cutouts"
-    MSK_DIR = r"C:\Users\Dell\Desktop\Case Study 2\Segmentation\Clean_Ground_Truth"
+    MSK_DIR = r"C:\Users\Dell\Desktop\Case Study 2\Segmentation\auto_masks\masks"
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
-    
-    # Initialize Model, Optimizer, and NEW FOCAL LOSS
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache() 
+        
     model = UNet().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = BCEDiceLoss(bce_weight=0.5)
     
-    # Using the math fix here!
-    criterion = FocalDiceLoss(gamma=2.0, alpha=0.25, dice_weight=0.5)
+    # Initialize the scaler for 16-bit mixed precision
     scaler = torch.amp.GradScaler('cuda')
-    ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
     
-   
     dataset = SegDataset(IMG_DIR, MSK_DIR)
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
@@ -136,18 +127,19 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
     
-    print(f"Training on {device} with FOCAL LOSS | Train: {train_size} | Val: {val_size}")
+    print(f"Training on {train_size} images, Validating on {val_size} images.")
     best_val_iou = 0.0
+    print(f"Training on {device}")
     
-    for epoch in range(20): # Running for 12 epochs to let the math settle
+    for epoch in range(10):
         model.train()
         total_loss = 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
-        
         for imgs, msks in pbar:
             imgs, msks = imgs.to(device), msks.to(device)
             optimizer.zero_grad()
-            
+        
+        
             with torch.amp.autocast('cuda'):
                 pred = model(imgs)
                 loss = criterion(pred, msks)
@@ -157,45 +149,41 @@ if __name__ == '__main__':
             scaler.update()
             
             total_loss += loss.item()
-            
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-        avg_loss = total_loss / len(train_loader)
         
-        # Validation
-        model.eval()
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch+1} COMPLETE - Avg Loss: {avg_loss:.4f}")
+        
+        # ================= VALIDATION PHASE =================
+        model.eval() 
         val_loss = 0
         val_iou = 0
-        val_ssim = 0
         
-        with torch.no_grad():
+        with torch.no_grad(): 
             for val_imgs, val_msks in val_loader:
                 val_imgs, val_msks = val_imgs.to(device), val_msks.to(device)
                 
                 with torch.amp.autocast('cuda'):
                     val_pred = model(val_imgs)
                     v_loss = criterion(val_pred, val_msks)
-                
+                    
                 val_loss += v_loss.item()
                 
-                # Metrics
+                # FIXED: Threshold is 0.0 because model outputs raw logits
                 pred_binary = (val_pred > 0.0).float()
                 intersection = (pred_binary * val_msks).sum()
                 union = pred_binary.sum() + val_msks.sum() - intersection
-                val_iou += ((intersection + 1e-6) / (union + 1e-6)).item()
-                val_ssim += ssim_metric(torch.sigmoid(val_pred), val_msks).item()
-        
+                iou = (intersection + 1e-6) / (union + 1e-6) 
+                val_iou += iou.item()
+                
         avg_val_loss = val_loss / len(val_loader)
         avg_val_iou = val_iou / len(val_loader)
-        avg_val_ssim = val_ssim / len(val_loader)
         
-        print(f"Epoch {epoch+1} COMPLETE")
-        print(f"   Train Loss: {avg_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
-        print(f"   Val IoU:    {avg_val_iou:.4f} | Val SSIM: {avg_val_ssim:.4f}")
+        print(f"Epoch {epoch+1} VAL - Loss: {avg_val_loss:.4f} | IoU: {avg_val_iou:.4f}")
         
         if avg_val_iou > best_val_iou:
             best_val_iou = avg_val_iou
-            torch.save(model.state_dict(), "best_signature_unet_focal.pth")
-            print(f"   --> 💾 Saved new BEST model! (IoU: {best_val_iou:.4f})")
-            
-    print("Training complete!")
+            torch.save(model.state_dict(), "best_signature_unet.pth")
+            print(f" Saved new BEST model! (IoU: {best_val_iou:.4f})")
+    
+    print(" Training complete! Check best_signature_unet.pth")
